@@ -172,4 +172,245 @@ static void on_accept(struct evloop *loop, void *arg)
   sol_info("New connection from %s on port %s", conn.ip, conf->port);
 }
 
+/*
+ * Parse packet header, it is required at least the Fixed Header
+ * of each packed, which is contained in the first 2 bytes in order
+ * to read packet type and total lenght that we need to recv to 
+ * complete the packet.
+ *
+ * This function accept a socket fd, a buffer to read incoming
+ * streams of bytes and a structure formed by 2 fields.
+ *
+ * - buf -> a byte buffer, it will be malloc'ed in the function and
+ *          it will contain the serialized bytes of the incoming packet.
+ * - flags -> flags pointer, copy the flag setting of the incoming paclet,
+ *            again for simplicity and convenience of the caller.
+ */ 
+static ssize_t recv_packet(int clientfd, unsigned char *buf, char *command)
+{
+  ssize_t nbytes = 0;
+
+  /* Read the first byte, it should contain the message type code */
+  if ((nbytes == recv_bytes(clientfd, buf, 1)) <= 0) {
+    return -ERRCLIENTDC;
+  }
+
+  unsigned char byte = *buf;
+  buf++;
+
+  if (DISCONNECT < byte || CONNECT > byte) {
+    return -ERRPACKETERR;
+  }
+
+  /* Read remaining lenght bytes which starts at byte 2 and ca be long to 
+   * 4 bytes based on the size stored, so byte 2-5 is dedicated to the
+   * packet lenght.
+   */
+  unsigned char buff[4];
+  int count = 0;
+  int n = 0;
+
+  do {
+    if ((n = recv_bytes(clientfd, buf+count, 1)) <= 0) {
+      return -ERRCLIENTDC;
+    }
+
+    buff[count] = buf[count];
+    nbytes += n;
+  } while (buff[count++] & (1 << 7));
+
+  // Reset temporary buffer
+  const unsigned char *pbuf = &buff[0];
+  unsigned long long tlen = mqtt_decode_lenght(&pbuf);
+
+  /*
+   * Set return code to -ERRMAXREQSIZE in case the total packet len
+   * exceeds the configuration limit 'max_request_size'.
+   */
+  if (tlen > conf->max_request_size) {
+    nbytes = -ERRMAXREQSIZE;
+    goto exit;
+  }
+
+  /* Read remaining bytes to complete packet */
+  if ((n = recv_bytes(clientfd, buf+1, tlen)) < 0) {
+    goto err;
+  }
+
+  nbytes += n;
+  *command = byte;
+
+  exit:
+    return nbytes;
+  err:
+    shutdown(clientfd, 0);
+    close(clientfd);
+    return nbytes;
+}
+
+/* Handle incoming request, after being accepted or after a reply */
+static void on_read(struct evloop *loop, void *arg)
+{
+  struct closure *cb = arg;
+
+  /* Raw bytes buffer to handle input from client */
+  unsigned char *buffer = malloc(conf->max_request_size);
+  ssize_t bytes = 0;
+  char command = 0;
+
+  /* 
+   * We must read all incoming bytes untill an entire packet is
+   * recieved. This is achieved by following the MQTT v3.1.1
+   * protocol specifications, which send the size of the 
+   * remaining packet as the second byte. By knowing it we know
+   * if the packet is ready to be deserialized and used.
+   */ 
+  bytes = recv_packet(cb->fd, buffer, &command);
+
+  /*
+   * Looks like we got a client desconnection.
+   *
+   * TODO: Set a error handler for ERRMAXREQSIZE instead of 
+   * dropping client connection, explicitly returning an informative
+   * error code to the client connected.
+   */
+  if (bytes == -ERRCLIENTDC || bytes == -ERRMAXREQSIZE) {
+    goto errdc;
+  }
+
+  info.bytes_recv++;
+
+  /* 
+   * Unpack recieved bytes into a mqtt_packet structure and 
+   * execute the correct handler based on the type of the operation.
+   */
+  union mqtt_packet packet;
+  unpack_mqtt_packet(buffer, &packet);
+  union mqtt_header hdr = {
+    .byte = command
+  };
+
+  /* Execute command callback */
+  int rc = handlers[hdr.bits.type](cb, &packet);
+
+  if (rc == REARM_W) {
+    cb->call = on_write;
+
+    /*
+     * Reset handler to read_handler in order to read new
+     * incomming data and EPOLL event for read fds.
+     */
+    evloop_rearm_callback_write(loop, cb);
+  } else if (rc == REARM_R) {
+    cb->call = on_read;
+    evloop_rearm_callback_read(loop, cb);
+  }
+
+exit:
+  free(buffer);
+  return;
+errdc:
+  free(buffer);
+  sol_error("Dropping client");
+  shutdown(cb->fd, 0);
+  close(cb->fd);
+  hashtable_del(sol.clients, ((struct sol_client *) cb->obj)->client_id);
+  hashtable_del(sol.closures, cb->closure_id);
+  info.nclients--;
+  info.nconnections--;
+  return;
+}
+
+static void on_write(struct evloop *loop, void *arg)
+{
+  struct closure *cb = arg;
+  ssize_t sent;
+  if ((sent = send_bytes(cb->fd, cb->payload->data, cb->payload->size)) < 0) {
+    sol_error("Error writing on socket to client %s: %s",
+              ((struct sol_client *)cb->obj)->client_id, strerror(errno));
+
+    /* Update information stats */
+    info.bytes_sent += sent;
+    bytestring_release(cb->payload);
+    cb->payload = NULL;
+
+    /* Re-arm callback by setting EPOLL event on EPOLLIN to read fds and
+     * re-assinging the callback "on_read" for the next event.
+     */
+    cb->call = on_read;
+    evloop_rearm_callback_read(loop, cb);
+  }
+}
+
+/* 
+ * Statistics topics, published every N seconds defined by configuration
+ * interval.
+ */
+#define SYS_TOPICS      14
+
+static const char *sys_topics[SYS_TOPICS] = {
+  "$SOL/",
+  "$SOL/broker/",
+  "$SOL/broker/clients/",
+  "$SOL/broker/bytes/",
+  "$SOL/broker/messages/",
+  "$SOL/broker/uptime/",
+  "$SOL/broker/uptime/sol",
+  "$SOL/broker/clients/connected/",
+  "$SOL/broker/clients/disconnected/",
+  "$SOL/broker/bytes/sent/",
+  "$SOL/broker/bytes/received/",
+  "$SOL/broker/messages/sent/",
+  "$SOL/broker/messages/received/",
+  "$SOL/broker/memory/used/",
+};
+
+static void run(struct evloop *loop)
+{
+  if (evloop_wait(loop) < 0) {
+    sol_error("Event loop exited unexpectedely: %s", strerror(loop->status));
+    evloop_free(loop);
+  }
+}
+
+/*
+ * Cleanup function to be passed in as a destructor to the hashtable for
+ * connecting clients
+ */ 
+static int client_destructor(struct hashtable_entry *entry)
+{
+  if (!entry) {
+    return -1;
+  }
+
+  struct sol_client *client = entry->val;
+
+  if (client->client_id) {
+    free(client->client_id);
+  }
+
+  free(client);
+  return 0;
+}
+
+/*
+ * Cleanup function to be passed in as a destructor to the hashtable for
+ * registered closures.
+ */ 
+static int client_destructor(struct hashtable_entry *entry)
+{
+  if (!entry) {
+    return -1;
+  }
+
+  struct closure *closure = entry->val;
+
+  if (closure->payload) {
+    bytestring_release(closure->payload);
+  }
+
+  free(closure);
+  return 0;
+}
+
 

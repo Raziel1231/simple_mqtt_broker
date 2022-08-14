@@ -34,4 +34,24 @@ void pack_u32(uint8_t **, uint32_t);
 // append len bytes into the bytestring
 void pack_bytes(uint8_t **, uint8_t *);
 
+/*
+ * bytestring structure, provides a convenient way of handling byte string data.
+ * It's essentially an unsigned char pointer that track the position of the
+ * last written byte and the total size of the bytestring.
+ */
+struct bytestring {
+  size_t size;
+  size_t last;
+  unsigned char *data;
+};
+
+/* 
+ * Const struct bystring constructor, it require a size cause we use 
+ * a bounded bytstring, e.g. no resize over a defined size.
+ */
+struct bytestring *bytestring_create(size_t);
+void bytestring_init(struct bytestring*, size_t);
+void bytestring_release(struct bytestring *);
+void bytestring_reset(struct bytestring *);
+
 #endif
